@@ -6,24 +6,21 @@ import psycopg2
 from decimal import Decimal
 from typing import List, Dict, Any
 
-# Import the provided library (must be in root dir)
+# Import the provided library
 from kraken_futures import KrakenFuturesApi
 
 # --- Configuration ---
-# API Credentials
 API_KEY = os.getenv("KRAKEN_FUTURES_KEY")
 API_SECRET = os.getenv("KRAKEN_FUTURES_SECRET")
-
-# Database URL (Railway provides this automatically)
 DATABASE_URL = os.getenv("DATABASE_URL")
-
-# Volume Directory (Updated to your specific path)
 VOLUME_DIR = os.getenv("VOLUME_DIR", "/mnt/data")
 
-# Loop Interval
+# Settings
 INTERVAL_SECONDS = 20
+HISTORY_FILE = "history.json"
+MAX_HISTORY_DAYS = 3
+MAX_HISTORY_POINTS = (MAX_HISTORY_DAYS * 24 * 60 * 60) // INTERVAL_SECONDS
 
-# --- Helper: JSON Encoder for Dates and Decimals ---
 class CustomEncoder(json.JSONEncoder):
     def default(self, obj):
         if isinstance(obj, (datetime.date, datetime.datetime)):
@@ -32,39 +29,40 @@ class CustomEncoder(json.JSONEncoder):
             return float(obj)
         return super().default(obj)
 
-def save_to_volume(filename: str, data: Any):
-    """Saves data as JSON to the configured volume directory."""
-    # Ensure directory exists
-    if not os.path.exists(VOLUME_DIR):
+def load_history():
+    filepath = os.path.join(VOLUME_DIR, HISTORY_FILE)
+    if os.path.exists(filepath):
         try:
-            os.makedirs(VOLUME_DIR, exist_ok=True)
-        except OSError as e:
-            print(f"[Error] Could not create directory {VOLUME_DIR}: {e}")
-            return
+            with open(filepath, "r") as f:
+                return json.load(f)
+        except:
+            return []
+    return []
 
-    filepath = os.path.join(VOLUME_DIR, filename)
+def save_history(history_data):
+    if not os.path.exists(VOLUME_DIR):
+        os.makedirs(VOLUME_DIR, exist_ok=True)
     
-    # Add a timestamp to the data structure
-    wrapper = {
-        "last_updated": datetime.datetime.utcnow().isoformat(),
-        "data": data
-    }
+    filepath = os.path.join(VOLUME_DIR, HISTORY_FILE)
     
+    # Prune old data (keep last N points)
+    if len(history_data) > MAX_HISTORY_POINTS:
+        history_data = history_data[-MAX_HISTORY_POINTS:]
+        
     try:
         with open(filepath, "w") as f:
-            json.dump(wrapper, f, cls=CustomEncoder, indent=2)
-        print(f"[Saved] {filename}")
+            json.dump(history_data, f, cls=CustomEncoder)
+        print(f"[Saved] History updated. Total points: {len(history_data)}")
     except Exception as e:
-        print(f"[Error] Failed to write {filename}: {e}")
+        print(f"[Error] Failed to write history: {e}")
 
-def fetch_signals_from_db() -> List[Dict]:
-    """Fetches signals from the live_matrix table in Postgres."""
+def fetch_signals_from_db() -> Dict[str, Any]:
+    """Fetches signals and returns a dict keyed by asset for easier mapping."""
     if not DATABASE_URL:
-        print("[Error] DATABASE_URL not set.")
-        return []
+        return {}
 
     query = "SELECT asset, tf, signal_val, updated_at FROM live_matrix;"
-    results = []
+    signals = {}
     
     try:
         conn = psycopg2.connect(DATABASE_URL)
@@ -73,59 +71,77 @@ def fetch_signals_from_db() -> List[Dict]:
         rows = cursor.fetchall()
         
         for row in rows:
-            results.append({
-                "asset": row[0],
+            # Store by asset name (e.g., 'BTCUSDT': { ... })
+            signals[row[0]] = {
                 "tf": row[1],
                 "signal_val": row[2],
                 "updated_at": row[3]
-            })
+            }
             
         cursor.close()
         conn.close()
     except Exception as e:
-        print(f"[DB Error] Could not fetch signals: {e}")
-        return [] 
+        print(f"[DB Error] {e}")
         
-    return results
+    return signals
+
+def extract_margin_equity(accounts_response):
+    """Finds the marginEquity in the flex account."""
+    # Response structure usually: {'accounts': [{'type': 'flex', 'balances': {...}, 'auxiliary': {'marginEquity': 123...}}]}
+    try:
+        if "accounts" in accounts_response:
+            for acc in accounts_response["accounts"]:
+                if acc.get("type") == "flex":
+                    return float(acc.get("auxiliary", {}).get("marginEquity", 0.0))
+        return 0.0
+    except:
+        return 0.0
 
 def main():
-    print("--- Starting Kraken Futures Monitor ---")
-    print(f"Volume Path: {VOLUME_DIR}")
+    print("--- Starting Historical Monitor ---")
     
-    # Check credentials
-    if not API_KEY or not API_SECRET:
-        print("WARNING: API Credentials not found in environment variables.")
-        # We continue anyway to test DB connection, but API calls will fail
-    
-    # Initialize API
-    kraken = KrakenFuturesApi(API_KEY, API_SECRET) if (API_KEY and API_SECRET) else None
+    kraken = None
+    if API_KEY and API_SECRET:
+        kraken = KrakenFuturesApi(API_KEY, API_SECRET)
+
+    # Load existing history so we don't lose data on restart
+    history = load_history()
 
     while True:
         loop_start = time.time()
+        timestamp = datetime.datetime.utcnow().isoformat()
+        
+        entry = {
+            "timestamp": timestamp,
+            "margin_equity": 0.0,
+            "positions": [],
+            "signals": {}
+        }
         
         try:
-            # 1. Fetch Portfolio Value (Accounts)
+            # 1. Fetch Equity
             if kraken:
-                accounts_data = kraken.get_accounts()
-                save_to_volume("portfolio_snapshot.json", accounts_data)
+                accounts = kraken.get_accounts()
+                entry["margin_equity"] = extract_margin_equity(accounts)
 
-            # 2. Fetch Open Positions
+            # 2. Fetch Positions
             if kraken:
-                positions_data = kraken.get_open_positions()
-                save_to_volume("positions_snapshot.json", positions_data)
+                # get_open_positions returns {'openPositions': [...]}
+                pos_data = kraken.get_open_positions()
+                entry["positions"] = pos_data.get("openPositions", [])
 
-            # 3. Fetch Signals from DB
-            signals_data = fetch_signals_from_db()
-            save_to_volume("signals_snapshot.json", signals_data)
+            # 3. Fetch Signals
+            entry["signals"] = fetch_signals_from_db()
+            
+            # Append and Save
+            history.append(entry)
+            save_history(history)
 
         except Exception as e:
-            print(f"[Loop Error] An unexpected error occurred: {e}")
+            print(f"[Loop Error] {e}")
 
-        # Sleep logic to maintain roughly 20s interval
         elapsed = time.time() - loop_start
         sleep_time = max(0, INTERVAL_SECONDS - elapsed)
-        
-        # Avoid spamming logs if sleeping
         if sleep_time > 0:
             time.sleep(sleep_time)
 
