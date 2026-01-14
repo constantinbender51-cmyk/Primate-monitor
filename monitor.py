@@ -6,23 +6,24 @@ import psycopg2
 from decimal import Decimal
 from typing import List, Dict, Any
 
+# Import the provided library (must be in root dir)
 from kraken_futures import KrakenFuturesApi
 
 # --- Configuration ---
+# API Credentials
 API_KEY = os.getenv("KRAKEN_FUTURES_KEY")
 API_SECRET = os.getenv("KRAKEN_FUTURES_SECRET")
+
+# Database URL (Railway provides this automatically)
 DATABASE_URL = os.getenv("DATABASE_URL")
+
+# Volume Directory (Updated to your specific path)
 VOLUME_DIR = os.getenv("VOLUME_DIR", "/mnt/data")
 
-# Settings
+# Loop Interval
 INTERVAL_SECONDS = 20
-HISTORY_FILE = "history.json"
-MAX_HISTORY_DAYS = 3
-MAX_HISTORY_POINTS = (MAX_HISTORY_DAYS * 24 * 60 * 60) // INTERVAL_SECONDS
 
-# We prioritize this timeframe for the dashboard plot
-PREFERRED_TIMEFRAME = "15m"
-
+# --- Helper: JSON Encoder for Dates and Decimals ---
 class CustomEncoder(json.JSONEncoder):
     def default(self, obj):
         if isinstance(obj, (datetime.date, datetime.datetime)):
@@ -31,42 +32,39 @@ class CustomEncoder(json.JSONEncoder):
             return float(obj)
         return super().default(obj)
 
-def load_history():
-    filepath = os.path.join(VOLUME_DIR, HISTORY_FILE)
-    if os.path.exists(filepath):
-        try:
-            with open(filepath, "r") as f:
-                return json.load(f)
-        except:
-            return []
-    return []
-
-def save_history(history_data):
+def save_to_volume(filename: str, data: Any):
+    """Saves data as JSON to the configured volume directory."""
+    # Ensure directory exists
     if not os.path.exists(VOLUME_DIR):
-        os.makedirs(VOLUME_DIR, exist_ok=True)
+        try:
+            os.makedirs(VOLUME_DIR, exist_ok=True)
+        except OSError as e:
+            print(f"[Error] Could not create directory {VOLUME_DIR}: {e}")
+            return
+
+    filepath = os.path.join(VOLUME_DIR, filename)
     
-    filepath = os.path.join(VOLUME_DIR, HISTORY_FILE)
+    # Add a timestamp to the data structure
+    wrapper = {
+        "last_updated": datetime.datetime.utcnow().isoformat(),
+        "data": data
+    }
     
-    if len(history_data) > MAX_HISTORY_POINTS:
-        history_data = history_data[-MAX_HISTORY_POINTS:]
-        
     try:
         with open(filepath, "w") as f:
-            json.dump(history_data, f, cls=CustomEncoder)
-        # print(f"[Saved] History updated. Points: {len(history_data)}") 
+            json.dump(wrapper, f, cls=CustomEncoder, indent=2)
+        print(f"[Saved] {filename}")
     except Exception as e:
-        print(f"[Error] Failed to write history: {e}")
+        print(f"[Error] Failed to write {filename}: {e}")
 
-def fetch_signals_from_db() -> Dict[str, Any]:
-    """
-    Fetches signals. Returns a simplified dict: {'BTCUSDT': signal_value, ...}
-    Prioritizes PREFERRED_TIMEFRAME (15m) to avoid overwriting.
-    """
+def fetch_signals_from_db() -> List[Dict]:
+    """Fetches signals from the live_matrix table in Postgres."""
     if not DATABASE_URL:
-        return {}
+        print("[Error] DATABASE_URL not set.")
+        return []
 
     query = "SELECT asset, tf, signal_val, updated_at FROM live_matrix;"
-    signals = {}
+    results = []
     
     try:
         conn = psycopg2.connect(DATABASE_URL)
@@ -74,91 +72,60 @@ def fetch_signals_from_db() -> Dict[str, Any]:
         cursor.execute(query)
         rows = cursor.fetchall()
         
-        # Temp storage to find best TF
-        temp_data = []
         for row in rows:
-            temp_data.append({"asset": row[0], "tf": row[1], "val": row[2]})
+            results.append({
+                "asset": row[0],
+                "tf": row[1],
+                "signal_val": row[2],
+                "updated_at": row[3]
+            })
             
-        # Filter for preferred TF, fallback to others if needed
-        for item in temp_data:
-            asset = item["asset"]
-            tf = item["tf"]
-            
-            # If we haven't seen this asset yet, take it
-            if asset not in signals:
-                signals[asset] = item
-            
-            # If this is our preferred TF, strictly overwrite whatever we had
-            if tf == PREFERRED_TIMEFRAME:
-                signals[asset] = item
-
         cursor.close()
         conn.close()
     except Exception as e:
-        print(f"[DB Error] {e}")
+        print(f"[DB Error] Could not fetch signals: {e}")
+        return [] 
         
-    return signals
-
-def extract_margin_equity(accounts_response):
-    """
-    Finds marginEquity in the multiCollateralMarginAccount.
-    """
-    # 1. Check if 'accounts' key exists
-    if not accounts_response or "accounts" not in accounts_response:
-        return 0.0
-
-    acc_list = accounts_response["accounts"]
-    
-    # 2. Iterate to find the correct type
-    for acc in acc_list:
-        # Check for the type defined in schema
-        if acc.get("type") == "multiCollateralMarginAccount":
-            # 3. Extract direct field
-            return float(acc.get("marginEquity", 0.0))
-            
-    return 0.0
+    return results
 
 def main():
-    print("--- Starting Monitor (Fixed) ---")
+    print("--- Starting Kraken Futures Monitor ---")
+    print(f"Volume Path: {VOLUME_DIR}")
     
-    kraken = None
-    if API_KEY and API_SECRET:
-        kraken = KrakenFuturesApi(API_KEY, API_SECRET)
-
-    history = load_history()
+    # Check credentials
+    if not API_KEY or not API_SECRET:
+        print("WARNING: API Credentials not found in environment variables.")
+        # We continue anyway to test DB connection, but API calls will fail
+    
+    # Initialize API
+    kraken = KrakenFuturesApi(API_KEY, API_SECRET) if (API_KEY and API_SECRET) else None
 
     while True:
         loop_start = time.time()
-        timestamp = datetime.datetime.utcnow().isoformat()
-        
-        entry = {
-            "timestamp": timestamp,
-            "margin_equity": 0.0,
-            "positions": [],
-            "signals": {}
-        }
         
         try:
+            # 1. Fetch Portfolio Value (Accounts)
             if kraken:
-                # 1. Fetch Equity
-                accounts = kraken.get_accounts()
-                entry["margin_equity"] = extract_margin_equity(accounts)
+                accounts_data = kraken.get_accounts()
+                save_to_volume("portfolio_snapshot.json", accounts_data)
 
-                # 2. Fetch Positions
-                pos_data = kraken.get_open_positions()
-                entry["positions"] = pos_data.get("openPositions", [])
+            # 2. Fetch Open Positions
+            if kraken:
+                positions_data = kraken.get_open_positions()
+                save_to_volume("positions_snapshot.json", positions_data)
 
-            # 3. Fetch Signals
-            entry["signals"] = fetch_signals_from_db()
-            
-            history.append(entry)
-            save_history(history)
+            # 3. Fetch Signals from DB
+            signals_data = fetch_signals_from_db()
+            save_to_volume("signals_snapshot.json", signals_data)
 
         except Exception as e:
-            print(f"[Loop Error] {e}")
+            print(f"[Loop Error] An unexpected error occurred: {e}")
 
+        # Sleep logic to maintain roughly 20s interval
         elapsed = time.time() - loop_start
         sleep_time = max(0, INTERVAL_SECONDS - elapsed)
+        
+        # Avoid spamming logs if sleeping
         if sleep_time > 0:
             time.sleep(sleep_time)
 
