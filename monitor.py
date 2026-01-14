@@ -81,13 +81,16 @@ def save_history_snapshot(portfolio, positions, signals):
     c = conn.cursor()
     now = datetime.datetime.utcnow()
 
-    # 1. Log Equity (Corrected Logic)
-    # The 'flex' key contains the aggregated margin equity for the Multi-Collateral wallet.
+    # 1. Log Equity (Corrected Path)
+    # Path: portfolio -> accounts -> flex -> marginEquity
     try:
         total_equity = 0.0
-        if isinstance(portfolio, dict) and "flex" in portfolio:
-            # Extract directly from the flex object
-            flex_wallet = portfolio["flex"]
+        
+        # Navigate safely to ['accounts']['flex']
+        accounts = portfolio.get("accounts", {})
+        if isinstance(accounts, dict):
+            flex_wallet = accounts.get("flex", {})
+            # Get marginEquity, default to 0 if missing
             total_equity = float(flex_wallet.get("marginEquity", 0))
         
         c.execute("INSERT INTO equity_log VALUES (?, ?)", (now, total_equity))
@@ -169,7 +172,6 @@ def main():
         try:
             # 1. Fetch Data
             if kraken:
-                # get_accounts() returns the dict with keys: flex, cash, f_xbtusd, etc.
                 portfolio_data = kraken.get_accounts()
                 positions_data = kraken.get_open_positions()
             
