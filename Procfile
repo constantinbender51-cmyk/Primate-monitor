@@ -1,1 +1,1 @@
-worker: python monitor.py & python dashboard.py
+worker: python main.py
