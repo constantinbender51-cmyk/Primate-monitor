@@ -2,28 +2,119 @@ import os
 import time
 import json
 import datetime
+import sqlite3
 import psycopg2
 from decimal import Decimal
 from typing import List, Dict, Any
 
-# Import the provided library (must be in root dir)
+# Import your library
 from kraken_futures import KrakenFuturesApi
 
 # --- Configuration ---
-# API Credentials
 API_KEY = os.getenv("KRAKEN_FUTURES_KEY")
 API_SECRET = os.getenv("KRAKEN_FUTURES_SECRET")
-
-# Database URL (Railway provides this automatically)
 DATABASE_URL = os.getenv("DATABASE_URL")
-
-# Volume Directory (Updated to your specific path)
 VOLUME_DIR = os.getenv("VOLUME_DIR", "/mnt/data")
-
-# Loop Interval
+DB_PATH = os.path.join(VOLUME_DIR, "history.db")
 INTERVAL_SECONDS = 20
+RETENTION_DAYS = 7
 
-# --- Helper: JSON Encoder for Dates and Decimals ---
+# --- Database Management ---
+def init_db():
+    """Initializes the SQLite database for historical tracking."""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    
+    # 1. Equity History
+    c.execute('''CREATE TABLE IF NOT EXISTS equity_log (
+                    timestamp DATETIME,
+                    equity REAL
+                )''')
+    
+    # 2. Positions History
+    c.execute('''CREATE TABLE IF NOT EXISTS position_log (
+                    timestamp DATETIME,
+                    symbol TEXT,
+                    size REAL,
+                    side TEXT
+                )''')
+
+    # 3. Signals History
+    c.execute('''CREATE TABLE IF NOT EXISTS signal_log (
+                    timestamp DATETIME,
+                    asset TEXT,
+                    tf TEXT,
+                    signal_val INTEGER
+                )''')
+    
+    # Index for speed
+    c.execute('CREATE INDEX IF NOT EXISTS idx_equity_ts ON equity_log (timestamp)')
+    c.execute('CREATE INDEX IF NOT EXISTS idx_pos_ts ON position_log (timestamp)')
+    c.execute('CREATE INDEX IF NOT EXISTS idx_sig_ts ON signal_log (timestamp)')
+    
+    conn.commit()
+    conn.close()
+
+def prune_old_data():
+    """Deletes data older than RETENTION_DAYS."""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    cutoff = datetime.datetime.utcnow() - datetime.timedelta(days=RETENTION_DAYS)
+    
+    c.execute("DELETE FROM equity_log WHERE timestamp < ?", (cutoff,))
+    c.execute("DELETE FROM position_log WHERE timestamp < ?", (cutoff,))
+    c.execute("DELETE FROM signal_log WHERE timestamp < ?", (cutoff,))
+    
+    conn.commit()
+    conn.close()
+
+def save_history_snapshot(portfolio, positions, signals):
+    """Parses raw API data and inserts into SQLite."""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    now = datetime.datetime.utcnow()
+
+    # 1. Log Equity (Extracting from the 'flex' or 'cash' account)
+    # The JSON structure implies 'accounts' is a list. We look for 'flex' or sum them.
+    try:
+        total_equity = 0.0
+        accounts = portfolio.get("accounts", [])
+        # Fallback if structure is different
+        if isinstance(portfolio, dict) and "flex" in portfolio:
+             accounts = [portfolio["flex"]] # Handle simplified structure if needed
+        
+        for acc in accounts:
+            # Check keys based on your screenshot/json
+            if isinstance(acc, dict):
+                # Try finding marginEquity in the account dict
+                eq = acc.get("marginEquity") or acc.get("totalEquity") or 0
+                total_equity += float(eq)
+        
+        c.execute("INSERT INTO equity_log VALUES (?, ?)", (now, total_equity))
+    except Exception as e:
+        print(f"[Data Error] Could not parse equity: {e}")
+
+    # 2. Log Positions
+    try:
+        open_positions = positions.get("openPositions", [])
+        for pos in open_positions:
+            c.execute("INSERT INTO position_log VALUES (?, ?, ?, ?)", 
+                      (now, pos.get("symbol"), float(pos.get("size", 0)), pos.get("side")))
+    except Exception as e:
+        print(f"[Data Error] Could not parse positions: {e}")
+
+    # 3. Log Signals
+    try:
+        for sig in signals:
+            c.execute("INSERT INTO signal_log VALUES (?, ?, ?, ?)", 
+                      (now, sig.get("asset"), sig.get("tf"), int(sig.get("signal_val", 0))))
+    except Exception as e:
+        print(f"[Data Error] Could not parse signals: {e}")
+
+    conn.commit()
+    conn.close()
+
+# --- Helper: JSON Encoder ---
 class CustomEncoder(json.JSONEncoder):
     def default(self, obj):
         if isinstance(obj, (datetime.date, datetime.datetime)):
@@ -33,101 +124,74 @@ class CustomEncoder(json.JSONEncoder):
         return super().default(obj)
 
 def save_to_volume(filename: str, data: Any):
-    """Saves data as JSON to the configured volume directory."""
-    # Ensure directory exists
+    """Saves current snapshot JSON (legacy support for dashboard tables)."""
     if not os.path.exists(VOLUME_DIR):
-        try:
-            os.makedirs(VOLUME_DIR, exist_ok=True)
-        except OSError as e:
-            print(f"[Error] Could not create directory {VOLUME_DIR}: {e}")
-            return
-
+        os.makedirs(VOLUME_DIR, exist_ok=True)
     filepath = os.path.join(VOLUME_DIR, filename)
-    
-    # Add a timestamp to the data structure
-    wrapper = {
-        "last_updated": datetime.datetime.utcnow().isoformat(),
-        "data": data
-    }
-    
+    wrapper = { "last_updated": datetime.datetime.utcnow().isoformat(), "data": data }
     try:
         with open(filepath, "w") as f:
             json.dump(wrapper, f, cls=CustomEncoder, indent=2)
-        print(f"[Saved] {filename}")
     except Exception as e:
         print(f"[Error] Failed to write {filename}: {e}")
 
 def fetch_signals_from_db() -> List[Dict]:
-    """Fetches signals from the live_matrix table in Postgres."""
-    if not DATABASE_URL:
-        print("[Error] DATABASE_URL not set.")
-        return []
-
+    if not DATABASE_URL: return []
     query = "SELECT asset, tf, signal_val, updated_at FROM live_matrix;"
     results = []
-    
     try:
         conn = psycopg2.connect(DATABASE_URL)
         cursor = conn.cursor()
         cursor.execute(query)
         rows = cursor.fetchall()
-        
         for row in rows:
-            results.append({
-                "asset": row[0],
-                "tf": row[1],
-                "signal_val": row[2],
-                "updated_at": row[3]
-            })
-            
+            results.append({ "asset": row[0], "tf": row[1], "signal_val": row[2], "updated_at": row[3] })
         cursor.close()
         conn.close()
     except Exception as e:
         print(f"[DB Error] Could not fetch signals: {e}")
-        return [] 
-        
+        return []
     return results
 
 def main():
-    print("--- Starting Kraken Futures Monitor ---")
-    print(f"Volume Path: {VOLUME_DIR}")
+    print("--- Starting Kraken Futures Monitor (with History) ---")
     
-    # Check credentials
-    if not API_KEY or not API_SECRET:
-        print("WARNING: API Credentials not found in environment variables.")
-        # We continue anyway to test DB connection, but API calls will fail
-    
-    # Initialize API
+    # Initialize SQLite
+    init_db()
+
     kraken = KrakenFuturesApi(API_KEY, API_SECRET) if (API_KEY and API_SECRET) else None
 
     while True:
         loop_start = time.time()
         
+        portfolio_data = {}
+        positions_data = {}
+        signals_data = []
+
         try:
-            # 1. Fetch Portfolio Value (Accounts)
+            # 1. Fetch Data
             if kraken:
-                accounts_data = kraken.get_accounts()
-                save_to_volume("portfolio_snapshot.json", accounts_data)
-
-            # 2. Fetch Open Positions
-            if kraken:
+                portfolio_data = kraken.get_accounts()
                 positions_data = kraken.get_open_positions()
-                save_to_volume("positions_snapshot.json", positions_data)
-
-            # 3. Fetch Signals from DB
+            
             signals_data = fetch_signals_from_db()
+
+            # 2. Save Snapshots (for current view)
+            save_to_volume("portfolio_snapshot.json", portfolio_data)
+            save_to_volume("positions_snapshot.json", positions_data)
             save_to_volume("signals_snapshot.json", signals_data)
 
-        except Exception as e:
-            print(f"[Loop Error] An unexpected error occurred: {e}")
+            # 3. Save History (for plots)
+            save_history_snapshot(portfolio_data, positions_data, signals_data)
+            
+            # 4. Prune old data (run occasionally, e.g., every cycle is fine for SQLite)
+            prune_old_data()
 
-        # Sleep logic to maintain roughly 20s interval
+        except Exception as e:
+            print(f"[Loop Error] {e}")
+
         elapsed = time.time() - loop_start
-        sleep_time = max(0, INTERVAL_SECONDS - elapsed)
-        
-        # Avoid spamming logs if sleeping
-        if sleep_time > 0:
-            time.sleep(sleep_time)
+        time.sleep(max(0, INTERVAL_SECONDS - elapsed))
 
 if __name__ == "__main__":
     main()
