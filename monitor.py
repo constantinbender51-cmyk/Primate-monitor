@@ -22,6 +22,10 @@ RETENTION_DAYS = 7
 # --- Database Management ---
 def init_db():
     """Initializes the SQLite database for historical tracking."""
+    # Ensure volume directory exists
+    if not os.path.exists(VOLUME_DIR):
+        os.makedirs(VOLUME_DIR, exist_ok=True)
+
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     
@@ -47,7 +51,7 @@ def init_db():
                     signal_val INTEGER
                 )''')
     
-    # Index for speed
+    # Indexes for faster plotting queries
     c.execute('CREATE INDEX IF NOT EXISTS idx_equity_ts ON equity_log (timestamp)')
     c.execute('CREATE INDEX IF NOT EXISTS idx_pos_ts ON position_log (timestamp)')
     c.execute('CREATE INDEX IF NOT EXISTS idx_sig_ts ON signal_log (timestamp)')
@@ -57,16 +61,19 @@ def init_db():
 
 def prune_old_data():
     """Deletes data older than RETENTION_DAYS."""
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    cutoff = datetime.datetime.utcnow() - datetime.timedelta(days=RETENTION_DAYS)
-    
-    c.execute("DELETE FROM equity_log WHERE timestamp < ?", (cutoff,))
-    c.execute("DELETE FROM position_log WHERE timestamp < ?", (cutoff,))
-    c.execute("DELETE FROM signal_log WHERE timestamp < ?", (cutoff,))
-    
-    conn.commit()
-    conn.close()
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        cutoff = datetime.datetime.utcnow() - datetime.timedelta(days=RETENTION_DAYS)
+        
+        c.execute("DELETE FROM equity_log WHERE timestamp < ?", (cutoff,))
+        c.execute("DELETE FROM position_log WHERE timestamp < ?", (cutoff,))
+        c.execute("DELETE FROM signal_log WHERE timestamp < ?", (cutoff,))
+        
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"[Prune Error] {e}")
 
 def save_history_snapshot(portfolio, positions, signals):
     """Parses raw API data and inserts into SQLite."""
@@ -74,21 +81,14 @@ def save_history_snapshot(portfolio, positions, signals):
     c = conn.cursor()
     now = datetime.datetime.utcnow()
 
-    # 1. Log Equity (Extracting from the 'flex' or 'cash' account)
-    # The JSON structure implies 'accounts' is a list. We look for 'flex' or sum them.
+    # 1. Log Equity (Corrected Logic)
+    # The 'flex' key contains the aggregated margin equity for the Multi-Collateral wallet.
     try:
         total_equity = 0.0
-        accounts = portfolio.get("accounts", [])
-        # Fallback if structure is different
         if isinstance(portfolio, dict) and "flex" in portfolio:
-             accounts = [portfolio["flex"]] # Handle simplified structure if needed
-        
-        for acc in accounts:
-            # Check keys based on your screenshot/json
-            if isinstance(acc, dict):
-                # Try finding marginEquity in the account dict
-                eq = acc.get("marginEquity") or acc.get("totalEquity") or 0
-                total_equity += float(eq)
+            # Extract directly from the flex object
+            flex_wallet = portfolio["flex"]
+            total_equity = float(flex_wallet.get("marginEquity", 0))
         
         c.execute("INSERT INTO equity_log VALUES (?, ?)", (now, total_equity))
     except Exception as e:
@@ -124,9 +124,7 @@ class CustomEncoder(json.JSONEncoder):
         return super().default(obj)
 
 def save_to_volume(filename: str, data: Any):
-    """Saves current snapshot JSON (legacy support for dashboard tables)."""
-    if not os.path.exists(VOLUME_DIR):
-        os.makedirs(VOLUME_DIR, exist_ok=True)
+    """Saves current snapshot JSON for the live dashboard view."""
     filepath = os.path.join(VOLUME_DIR, filename)
     wrapper = { "last_updated": datetime.datetime.utcnow().isoformat(), "data": data }
     try:
@@ -171,12 +169,13 @@ def main():
         try:
             # 1. Fetch Data
             if kraken:
+                # get_accounts() returns the dict with keys: flex, cash, f_xbtusd, etc.
                 portfolio_data = kraken.get_accounts()
                 positions_data = kraken.get_open_positions()
             
             signals_data = fetch_signals_from_db()
 
-            # 2. Save Snapshots (for current view)
+            # 2. Save Snapshots (for current table view)
             save_to_volume("portfolio_snapshot.json", portfolio_data)
             save_to_volume("positions_snapshot.json", positions_data)
             save_to_volume("signals_snapshot.json", signals_data)
@@ -184,7 +183,7 @@ def main():
             # 3. Save History (for plots)
             save_history_snapshot(portfolio_data, positions_data, signals_data)
             
-            # 4. Prune old data (run occasionally, e.g., every cycle is fine for SQLite)
+            # 4. Prune old data
             prune_old_data()
 
         except Exception as e:
