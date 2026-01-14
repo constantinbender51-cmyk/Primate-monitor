@@ -1,141 +1,206 @@
 import http.server
 import json
 import os
-import datetime
-from http import HTTPStatus
+import io
+import matplotlib
+# Set backend to Agg to avoid needing a GUI
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+from datetime import datetime
 
 # Configuration
-PORT = int(os.environ.get("PORT", 8080))  # Railway usually listens on 8080 or provides PORT env
+PORT = int(os.environ.get("PORT", 8080))
 DATA_DIR = os.environ.get("VOLUME_DIR", "/mnt/data/")
+HISTORY_FILE = "history.json"
 
 class RequestHandler(http.server.BaseHTTPRequestHandler):
-    def _read_json(self, filename):
-        """Helper to safely read JSON from the volume."""
-        filepath = os.path.join(DATA_DIR, filename)
+    def _read_history(self):
+        filepath = os.path.join(DATA_DIR, HISTORY_FILE)
         if not os.path.exists(filepath):
-            return None
+            return []
         try:
             with open(filepath, "r") as f:
                 return json.load(f)
-        except Exception as e:
-            return {"error": str(e)}
+        except:
+            return []
 
-    def _html_template(self, body_content):
-        """Basic HTML wrapper with auto-refresh and styling."""
-        return f"""
-        <!DOCTYPE html>
-        <html>
-        <head>
-            <title>Kraken Monitor</title>
-            <meta http-equiv="refresh" content="20"> <style>
-                body {{ font-family: monospace; background: #1e1e1e; color: #d4d4d4; padding: 20px; }}
-                h1, h2 {{ color: #569cd6; border-bottom: 1px solid #333; padding-bottom: 5px; }}
-                .card {{ background: #252526; padding: 15px; margin-bottom: 20px; border-radius: 5px; border: 1px solid #333; }}
-                table {{ width: 100%; border-collapse: collapse; margin-top: 10px; }}
-                th {{ text-align: left; border-bottom: 1px solid #444; color: #ce9178; padding: 5px; }}
-                td {{ border-bottom: 1px solid #333; padding: 5px; }}
-                .timestamp {{ color: #6a9955; font-size: 0.9em; }}
-                .empty {{ color: #888; font-style: italic; }}
-                .positive {{ color: #6a9955; }}
-                .negative {{ color: #f44747; }}
-            </style>
-        </head>
-        <body>
-            <h1>Live Monitor Dashboard</h1>
-            {body_content}
-        </body>
-        </html>
-        """
+    def _generate_plots(self, history):
+        if not history:
+            return None
 
-    def _render_dict_table(self, title, json_obj):
-        """Renders a generic dictionary or list into an HTML table."""
-        if not json_obj:
-            return f"<div class='card'><h2>{title}</h2><p class='empty'>No data file found.</p></div>"
+        # --- Prepare Data Containers ---
+        timestamps = []
+        equity = []
         
-        last_updated = json_obj.get("last_updated", "Unknown")
-        data = json_obj.get("data", {})
+        # Asset map: symbol -> { 'times': [], 'sizes': [], 'signals': [] }
+        # We need to align signals to the same timestamps as positions
+        assets_data = {} 
 
-        html = f"<div class='card'><h2>{title} <span class='timestamp'>({last_updated})</span></h2>"
+        for entry in history:
+            try:
+                ts = datetime.fromisoformat(entry["timestamp"])
+                timestamps.append(ts)
+                equity.append(entry.get("margin_equity", 0))
 
-        if isinstance(data, list):
-            if not data:
-                html += "<p class='empty'>List is empty.</p>"
-            else:
-                # Create table headers from first item keys
-                keys = data[0].keys()
-                html += "<table><thead><tr>"
-                for k in keys:
-                    html += f"<th>{k}</th>"
-                html += "</tr></thead><tbody>"
-                for item in data:
-                    html += "<tr>"
-                    for k in keys:
-                        val = item.get(k, "")
-                        html += f"<td>{val}</td>"
-                    html += "</tr>"
-                html += "</tbody></table>"
+                # Process Positions
+                # Group current positions by symbol
+                current_positions = {p['symbol']: p for p in entry.get("positions", [])}
+                
+                # Process Signals
+                current_signals = entry.get("signals", {})
+
+                # We need a list of all assets seen in this history to ensure continuity
+                # For this simple version, we iterate what we found
+                
+                # Check mapping
+                # We iterate over the positions found in this entry to populate data
+                for symbol, pos in current_positions.items():
+                    # Initialize if new
+                    if symbol not in assets_data:
+                        assets_data[symbol] = {'times': [], 'sizes': [], 'signals': []}
+                    
+                    # Store data
+                    assets_data[symbol]['times'].append(ts)
+                    assets_data[symbol]['sizes'].append(float(pos.get('size', 0)))
+                    
+                    # Find matching signal
+                    # Mapping Logic:
+                    # pf_xrpusd -> Look for XRPUSDT
+                    # ff_xbtusd -> Look for BTCUSDT
+                    sig_val = 0
+                    
+                    if "xbt" in symbol.lower():
+                        sig_data = current_signals.get("BTCUSDT", {})
+                        sig_val = sig_data.get("signal_val", 0)
+                    elif "xrp" in symbol.lower():
+                        sig_data = current_signals.get("XRPUSDT", {})
+                        sig_val = sig_data.get("signal_val", 0)
+                    # Add more mappings here if needed
+                    
+                    assets_data[symbol]['signals'].append(float(sig_val))
+            
+            except Exception as e:
+                print(f"Error parsing entry: {e}")
+                continue
+
+        # --- Plotting ---
+        plot_files = []
+
+        # 1. Equity Plot
+        plt.figure(figsize=(10, 5))
+        plt.plot(timestamps, equity, label='Margin Equity', color='#569cd6')
+        plt.title("Portfolio Margin Equity (Last 3 Days)")
+        plt.gca().xaxis.set_major_formatter(mdates.DateFormatter('%m-%d %H:%M'))
+        plt.grid(True, which='both', linestyle='--', linewidth=0.5, color='#444')
+        plt.legend()
+        plt.tight_layout()
         
-        elif isinstance(data, dict):
-            if not data:
-                html += "<p class='empty'>Object is empty.</p>"
-            else:
-                html += "<table><thead><tr><th>Key</th><th>Value</th></tr></thead><tbody>"
-                for k, v in data.items():
-                    # If value is a complex list/dict, just stringify it to keep it simple
-                    display_val = json.dumps(v) if isinstance(v, (dict, list)) else v
-                    html += f"<tr><td>{k}</td><td>{display_val}</td></tr>"
-                html += "</tbody></table>"
-        
-        html += "</div>"
-        return html
+        eq_filename = "plot_equity.png"
+        plt.savefig(os.path.join(DATA_DIR, eq_filename), facecolor='#1e1e1e', edgecolor='none')
+        plt.close()
+        plot_files.append(("Total Portfolio Value", eq_filename))
+
+        # 2. Asset Plots
+        for symbol, data in assets_data.items():
+            if not data['times']: continue
+            
+            fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8), sharex=True, gridspec_kw={'height_ratios': [2, 1]})
+            
+            # Top: Position Size
+            ax1.plot(data['times'], data['sizes'], color='#4ec9b0', label=f'Position: {symbol}')
+            ax1.set_title(f"{symbol} - Position & Signal")
+            ax1.set_ylabel("Size")
+            ax1.grid(True, linestyle='--', alpha=0.3)
+            ax1.legend(loc='upper left')
+
+            # Bottom: Signal
+            ax2.step(data['times'], data['signals'], where='post', color='#ce9178', label='Signal (DB)')
+            ax2.set_ylabel("Signal Value")
+            ax2.set_yticks([-1, 0, 1]) # Assuming signals are -1, 0, 1
+            ax2.grid(True, linestyle='--', alpha=0.3)
+            ax2.xaxis.set_major_formatter(mdates.DateFormatter('%m-%d %H:%M'))
+            
+            # Styling for Dark Mode
+            for ax in [ax1, ax2]:
+                ax.set_facecolor('#252526')
+                ax.tick_params(colors='#d4d4d4')
+                ax.yaxis.label.set_color('#d4d4d4')
+                ax.xaxis.label.set_color('#d4d4d4')
+                ax.title.set_color('#d4d4d4')
+                for spine in ax.spines.values():
+                    spine.set_color('#555')
+
+            fig.patch.set_facecolor('#1e1e1e')
+            plt.tight_layout()
+            
+            filename = f"plot_{symbol}.png"
+            plt.savefig(os.path.join(DATA_DIR, filename), facecolor='#1e1e1e')
+            plt.close()
+            
+            plot_files.append((f"Asset: {symbol}", filename))
+
+        return plot_files
 
     def do_GET(self):
+        # Serve Images
+        if self.path.endswith(".png"):
+            filepath = os.path.join(DATA_DIR, os.path.basename(self.path))
+            if os.path.exists(filepath):
+                self.send_response(200)
+                self.send_header('Content-type', 'image/png')
+                self.end_headers()
+                with open(filepath, 'rb') as f:
+                    self.wfile.write(f.read())
+                return
+
         if self.path == "/":
-            # 1. Read Data
-            portfolio = self._read_json("portfolio_snapshot.json")
-            positions = self._read_json("positions_snapshot.json")
-            signals = self._read_json("signals_snapshot.json")
-
-            # 2. Build HTML Body
-            body = ""
+            history = self._read_history()
+            plots = self._generate_plots(history)
             
-            # Portfolio Section
-            # Flatten slightly for better display if 'accounts' exists
-            if portfolio and "accounts" in portfolio.get("data", {}):
-                # Just show the accounts list directly
-                # You might want to filter this in the monitor script if it's too large
-                body += self._render_dict_table("Portfolio Balances", {"last_updated": portfolio["last_updated"], "data": portfolio["data"]["accounts"]})
+            html = """
+            <!DOCTYPE html>
+            <html>
+            <head>
+                <title>Kraken Historical Monitor</title>
+                <meta http-equiv="refresh" content="60">
+                <style>
+                    body { font-family: sans-serif; background: #1e1e1e; color: #ccc; padding: 20px; }
+                    h1 { color: #569cd6; }
+                    .plot-container { margin-bottom: 40px; border: 1px solid #333; padding: 10px; background: #252526; }
+                    img { max-width: 100%; height: auto; }
+                    .warning { color: #ce9178; }
+                </style>
+            </head>
+            <body>
+                <h1>Historical Dashboard (3 Days)</h1>
+            """
+            
+            if not plots:
+                html += "<p class='warning'>No history data found yet. Wait for the monitor to run.</p>"
             else:
-                body += self._render_dict_table("Portfolio Raw", portfolio)
+                for title, filename in plots:
+                    html += f"""
+                    <div class='plot-container'>
+                        <h3>{title}</h3>
+                        <img src='/{filename}' />
+                    </div>
+                    """
 
-            # Positions Section
-            if positions and "openPositions" in positions.get("data", {}):
-                 body += self._render_dict_table("Open Positions", {"last_updated": positions["last_updated"], "data": positions["data"]["openPositions"]})
-            else:
-                body += self._render_dict_table("Open Positions", positions)
-
-            # Signals Section
-            body += self._render_dict_table("Signals (DB)", signals)
-
-            # 3. Send Response
-            self.send_response(HTTPStatus.OK)
+            html += "</body></html>"
+            
+            self.send_response(200)
             self.send_header("Content-type", "text/html")
             self.end_headers()
-            self.wfile.write(self._html_template(body).encode("utf-8"))
+            self.wfile.write(html.encode("utf-8"))
         else:
-            self.send_error(HTTPStatus.NOT_FOUND, "Not Found")
+            self.send_error(404)
 
-def run(server_class=http.server.ThreadingHTTPServer, handler_class=RequestHandler):
+def run():
     server_address = ("", PORT)
-    print(f"Starting Threaded HTTP Server on port {PORT}...")
-    print(f"Reading data from: {DATA_DIR}")
-    httpd = server_class(server_address, handler_class)
-    try:
-        httpd.serve_forever()
-    except KeyboardInterrupt:
-        pass
-    httpd.server_close()
-    print("Server stopped.")
+    print(f"Starting Dashboard on port {PORT}")
+    httpd = http.server.ThreadingHTTPServer(server_address, RequestHandler)
+    httpd.serve_forever()
 
 if __name__ == "__main__":
     run()
