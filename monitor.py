@@ -6,7 +6,6 @@ import psycopg2
 from decimal import Decimal
 from typing import List, Dict, Any
 
-# Import the provided library
 from kraken_futures import KrakenFuturesApi
 
 # --- Configuration ---
@@ -20,6 +19,9 @@ INTERVAL_SECONDS = 20
 HISTORY_FILE = "history.json"
 MAX_HISTORY_DAYS = 3
 MAX_HISTORY_POINTS = (MAX_HISTORY_DAYS * 24 * 60 * 60) // INTERVAL_SECONDS
+
+# We prioritize this timeframe for the dashboard plot
+PREFERRED_TIMEFRAME = "15m"
 
 class CustomEncoder(json.JSONEncoder):
     def default(self, obj):
@@ -45,19 +47,21 @@ def save_history(history_data):
     
     filepath = os.path.join(VOLUME_DIR, HISTORY_FILE)
     
-    # Prune old data (keep last N points)
     if len(history_data) > MAX_HISTORY_POINTS:
         history_data = history_data[-MAX_HISTORY_POINTS:]
         
     try:
         with open(filepath, "w") as f:
             json.dump(history_data, f, cls=CustomEncoder)
-        print(f"[Saved] History updated. Total points: {len(history_data)}")
+        # print(f"[Saved] History updated. Points: {len(history_data)}") 
     except Exception as e:
         print(f"[Error] Failed to write history: {e}")
 
 def fetch_signals_from_db() -> Dict[str, Any]:
-    """Fetches signals and returns a dict keyed by asset for easier mapping."""
+    """
+    Fetches signals. Returns a simplified dict: {'BTCUSDT': signal_value, ...}
+    Prioritizes PREFERRED_TIMEFRAME (15m) to avoid overwriting.
+    """
     if not DATABASE_URL:
         return {}
 
@@ -70,14 +74,24 @@ def fetch_signals_from_db() -> Dict[str, Any]:
         cursor.execute(query)
         rows = cursor.fetchall()
         
+        # Temp storage to find best TF
+        temp_data = []
         for row in rows:
-            # Store by asset name (e.g., 'BTCUSDT': { ... })
-            signals[row[0]] = {
-                "tf": row[1],
-                "signal_val": row[2],
-                "updated_at": row[3]
-            }
+            temp_data.append({"asset": row[0], "tf": row[1], "val": row[2]})
             
+        # Filter for preferred TF, fallback to others if needed
+        for item in temp_data:
+            asset = item["asset"]
+            tf = item["tf"]
+            
+            # If we haven't seen this asset yet, take it
+            if asset not in signals:
+                signals[asset] = item
+            
+            # If this is our preferred TF, strictly overwrite whatever we had
+            if tf == PREFERRED_TIMEFRAME:
+                signals[asset] = item
+
         cursor.close()
         conn.close()
     except Exception as e:
@@ -86,25 +100,31 @@ def fetch_signals_from_db() -> Dict[str, Any]:
     return signals
 
 def extract_margin_equity(accounts_response):
-    """Finds the marginEquity in the flex account."""
-    # Response structure usually: {'accounts': [{'type': 'flex', 'balances': {...}, 'auxiliary': {'marginEquity': 123...}}]}
-    try:
-        if "accounts" in accounts_response:
-            for acc in accounts_response["accounts"]:
-                if acc.get("type") == "flex":
-                    return float(acc.get("auxiliary", {}).get("marginEquity", 0.0))
-        return 0.0
-    except:
+    """
+    Finds marginEquity in the multiCollateralMarginAccount.
+    """
+    # 1. Check if 'accounts' key exists
+    if not accounts_response or "accounts" not in accounts_response:
         return 0.0
 
+    acc_list = accounts_response["accounts"]
+    
+    # 2. Iterate to find the correct type
+    for acc in acc_list:
+        # Check for the type defined in schema
+        if acc.get("type") == "multiCollateralMarginAccount":
+            # 3. Extract direct field
+            return float(acc.get("marginEquity", 0.0))
+            
+    return 0.0
+
 def main():
-    print("--- Starting Historical Monitor ---")
+    print("--- Starting Monitor (Fixed) ---")
     
     kraken = None
     if API_KEY and API_SECRET:
         kraken = KrakenFuturesApi(API_KEY, API_SECRET)
 
-    # Load existing history so we don't lose data on restart
     history = load_history()
 
     while True:
@@ -119,21 +139,18 @@ def main():
         }
         
         try:
-            # 1. Fetch Equity
             if kraken:
+                # 1. Fetch Equity
                 accounts = kraken.get_accounts()
                 entry["margin_equity"] = extract_margin_equity(accounts)
 
-            # 2. Fetch Positions
-            if kraken:
-                # get_open_positions returns {'openPositions': [...]}
+                # 2. Fetch Positions
                 pos_data = kraken.get_open_positions()
                 entry["positions"] = pos_data.get("openPositions", [])
 
             # 3. Fetch Signals
             entry["signals"] = fetch_signals_from_db()
             
-            # Append and Save
             history.append(entry)
             save_history(history)
 
