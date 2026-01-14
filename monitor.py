@@ -17,9 +17,8 @@ API_SECRET = os.getenv("KRAKEN_FUTURES_SECRET")
 # Database URL (Railway provides this automatically)
 DATABASE_URL = os.getenv("DATABASE_URL")
 
-# Volume Directory (Where to save files)
-# Ensure this matches your Railway Volume mount path. Defaulting to 'data' folder.
-VOLUME_DIR = os.getenv("VOLUME_DIR", "/app/data")
+# Volume Directory (Updated to your specific path)
+VOLUME_DIR = os.getenv("VOLUME_DIR", "/mnt/data")
 
 # Loop Interval
 INTERVAL_SECONDS = 20
@@ -35,9 +34,14 @@ class CustomEncoder(json.JSONEncoder):
 
 def save_to_volume(filename: str, data: Any):
     """Saves data as JSON to the configured volume directory."""
+    # Ensure directory exists
     if not os.path.exists(VOLUME_DIR):
-        os.makedirs(VOLUME_DIR, exist_ok=True)
-    
+        try:
+            os.makedirs(VOLUME_DIR, exist_ok=True)
+        except OSError as e:
+            print(f"[Error] Could not create directory {VOLUME_DIR}: {e}")
+            return
+
     filepath = os.path.join(VOLUME_DIR, filename)
     
     # Add a timestamp to the data structure
@@ -55,6 +59,10 @@ def save_to_volume(filename: str, data: Any):
 
 def fetch_signals_from_db() -> List[Dict]:
     """Fetches signals from the live_matrix table in Postgres."""
+    if not DATABASE_URL:
+        print("[Error] DATABASE_URL not set.")
+        return []
+
     query = "SELECT asset, tf, signal_val, updated_at FROM live_matrix;"
     results = []
     
@@ -76,7 +84,7 @@ def fetch_signals_from_db() -> List[Dict]:
         conn.close()
     except Exception as e:
         print(f"[DB Error] Could not fetch signals: {e}")
-        return [] # Return empty list on failure to keep loop alive
+        return [] 
         
     return results
 
@@ -84,27 +92,27 @@ def main():
     print("--- Starting Kraken Futures Monitor ---")
     print(f"Volume Path: {VOLUME_DIR}")
     
+    # Check credentials
     if not API_KEY or not API_SECRET:
         print("WARNING: API Credentials not found in environment variables.")
-        return
-
-    kraken = KrakenFuturesApi(API_KEY, API_SECRET)
+        # We continue anyway to test DB connection, but API calls will fail
+    
+    # Initialize API
+    kraken = KrakenFuturesApi(API_KEY, API_SECRET) if (API_KEY and API_SECRET) else None
 
     while True:
         loop_start = time.time()
         
         try:
             # 1. Fetch Portfolio Value (Accounts)
-            # This returns balances, auxiliary info, and total equity
-            accounts_data = kraken.get_accounts()
-            
-            # Extract useful summary if possible, or save raw
-            # 'accounts' key usually contains the list of wallet balances
-            save_to_volume("portfolio_snapshot.json", accounts_data)
+            if kraken:
+                accounts_data = kraken.get_accounts()
+                save_to_volume("portfolio_snapshot.json", accounts_data)
 
             # 2. Fetch Open Positions
-            positions_data = kraken.get_open_positions()
-            save_to_volume("positions_snapshot.json", positions_data)
+            if kraken:
+                positions_data = kraken.get_open_positions()
+                save_to_volume("positions_snapshot.json", positions_data)
 
             # 3. Fetch Signals from DB
             signals_data = fetch_signals_from_db()
@@ -117,8 +125,9 @@ def main():
         elapsed = time.time() - loop_start
         sleep_time = max(0, INTERVAL_SECONDS - elapsed)
         
-        print(f"Sleeping for {sleep_time:.2f}s...")
-        time.sleep(sleep_time)
+        # Avoid spamming logs if sleeping
+        if sleep_time > 0:
+            time.sleep(sleep_time)
 
 if __name__ == "__main__":
     main()
